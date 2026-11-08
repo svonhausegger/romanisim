@@ -1,3 +1,6 @@
+import copy
+import os
+
 import galsim
 import numpy as np
 
@@ -21,6 +24,28 @@ reciprocity_alpha = 0.0065
 
 #     print(f"{message}, RSS (Resident Set Size): {mem_info.rss / 1024 / 1024:.2f} MB")
 #     print(f"{message}, VMS (Virtual Memory Size): {mem_info.vms / 1024 / 1024:.2f} MB")
+
+
+# Frames at least this large are split into row blocks on threads in
+# Nonlinearity.apply (ROMANISIM_NTHREADS, default: CPUs available).
+_PARALLEL_MIN_SIZE = 4 * 1024 * 1024
+
+
+def _apply_nthreads():
+    env = os.environ.get('ROMANISIM_NTHREADS')
+    if env:
+        return max(1, int(env))
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # pragma: no cover - non-Linux
+        return max(1, os.cpu_count() or 1)
+
+
+def _rows(a, r0, r1, shape):
+    """Rows r0:r1 of a per-pixel array; scalars and non-image arrays as is."""
+    if np.ndim(a) >= 2 and tuple(np.shape(a)[-2:]) == tuple(shape):
+        return a[..., r0:r1, :]
+    return a
 
 
 def NLfunc(x):
@@ -336,6 +361,41 @@ class Nonlinearity(object):
         else:
             img_arr = img
 
+        nthreads = _apply_nthreads()
+        ny = np.shape(img_arr)[-2] if np.ndim(img_arr) >= 2 else 0
+        if (nthreads > 1 and np.size(img_arr) >= _PARALLEL_MIN_SIZE
+                and ny >= 2 * nthreads
+                and not isinstance(img_arr, u.Quantity)):
+            # elementwise in every pixel, so row blocks on threads give the
+            # same numbers as one call (numpy releases the GIL in the ufuncs)
+            shape2 = tuple(np.shape(img_arr)[-2:])
+            step = -(-ny // (4 * nthreads))
+            rows = [(r0, min(r0 + step, ny)) for r0 in range(0, ny, step)]
+
+            def one(r):
+                r0, r1 = r
+                sub = copy.copy(self)
+                sub.gain = _rows(self.gain, r0, r1, shape2)
+                sub.saturation = _rows(self.saturation, r0, r1, shape2)
+                sub.coeffs = _rows(self.coeffs, r0, r1, shape2)
+                return sub._apply_array(img_arr[..., r0:r1, :], electrons,
+                                        reversed)
+
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=nthreads) as pool:
+                parts = list(pool.map(one, rows))
+            corrected = np.concatenate(parts, axis=-2)
+        else:
+            corrected = self._apply_array(img_arr, electrons, reversed)
+
+        if isinstance(img, galsim.Image):
+            img.array = corrected
+        else:
+            img = corrected
+        return img
+
+    def _apply_array(self, img_arr, electrons=False, reversed=False):
+        """`apply` on a plain array (the original single-call body)."""
         if electrons:
             img_arr = img_arr / self.gain
 
@@ -351,12 +411,7 @@ class Nonlinearity(object):
 
         if electrons:
             corrected = corrected * self.gain
-
-        if isinstance(img, galsim.Image):
-            img.array = corrected
-        else:
-            img = corrected
-        return img
+        return corrected
 
     def inl_correction(self, counts):
         """Compute the integral nonlinearity correction.
