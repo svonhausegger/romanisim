@@ -11,7 +11,7 @@ cdef float[2][6] PTABLE = [
 cdef int PTABLE_LENGTH = 6
 
 
-cdef inline float get_weight_power(float s):
+cdef inline float get_weight_power(float s) noexcept nogil:
     cdef int i
     for i in range(PTABLE_LENGTH):
         if s < PTABLE[0][i]:
@@ -25,7 +25,7 @@ cdef inline float get_weight_power(float s):
 @cython.cpow(True)
 cdef inline (float, float, float) fit_one_ramp(
         float [:] resultants, int start, int end, float read_noise,
-        float [:] tbar, float [:] tau, int [:] nn):
+        float [:] tbar, float [:] tau, int [:] nn) noexcept nogil:
     """Fit a portion of single ramp using the Casertano+22 algorithm.
 
     Parameters
@@ -201,13 +201,22 @@ def fit_ramps(np.ndarray[float, ndim=2] resultants,
     cdef float [:] tbarview = tbar
     cdef float [:] tauview = tau
     cdef int [:] nnview = nn
-    for i in range(nramp):
-        slope0, slopereadvar0, slopepoissonvar0 = fit_one_ramp(
-            resview[:, pix[i]], resstart[i], resend[i], rnview[pix[i]],
-            tbarview, tauview, nnview)
-        slope[i] = slope0
-        slopereadvar[i] = slopereadvar0
-        slopepoissonvar[i] = slopepoissonvar0
+    cdef int [:] pixview = pix
+    cdef int [:] startview = resstart
+    cdef int [:] endview = resend
+    cdef float [:] slopeview = slope
+    cdef float [:] readvarview = slopereadvar
+    cdef float [:] poissonvarview = slopepoissonvar
+    # no Python objects in this loop: release the GIL so callers can fit
+    # disjoint pixel ranges on threads (romanisim.ramp.fit_ramps_casertano)
+    with nogil:
+        for i in range(nramp):
+            slope0, slopereadvar0, slopepoissonvar0 = fit_one_ramp(
+                resview[:, pixview[i]], startview[i], endview[i],
+                rnview[pixview[i]], tbarview, tauview, nnview)
+            slopeview[i] = slope0
+            readvarview[i] = slopereadvar0
+            poissonvarview[i] = slopepoissonvar0
 
     return dict(slope=slope, slopereadvar=slopereadvar,
                 slopepoissonvar=slopepoissonvar,

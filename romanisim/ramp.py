@@ -30,6 +30,8 @@ So the routines in these packages construct these different matrices, store
 them, and interpolate between them for different different fluxes and ratios.
 """
 
+import os
+
 import numpy as np
 from . import l1
 from romanisim.models import parameters
@@ -458,6 +460,42 @@ def simulate_many_ramps(ntrial=100, flux=100, readnoise=5, read_pattern=None):
     return (read_pattern, flux, readnoise, resultants)
 
 
+def _fit_ramps_threaded(resultants, dq, read_noise, read_pattern,
+                        nthreads=None, min_pixels=1 << 20):
+    """`romanisim.ramp_fit_casertano.fit_ramps` over contiguous pixel ranges on
+    threads (the Cython kernel releases the GIL), concatenated in pixel order.
+
+    Ramps are numbered in pixel order in one call too, so the result is the
+    same as a single call, element for element.
+    """
+    npix = resultants.shape[1]
+    if nthreads is None:
+        env = os.environ.get('ROMANISIM_NTHREADS')
+        try:
+            nthreads = int(env) if env else len(os.sched_getaffinity(0))
+        except AttributeError:  # pragma: no cover - non-Linux
+            nthreads = os.cpu_count() or 1
+    if nthreads <= 1 or npix < min_pixels:
+        return romanisim.ramp_fit_casertano.fit_ramps(
+            resultants, dq, read_noise, read_pattern)
+    step = -(-npix // (4 * nthreads))
+    ranges = [(a, min(a + step, npix)) for a in range(0, npix, step)]
+
+    def one(r):
+        a, b = r
+        out = romanisim.ramp_fit_casertano.fit_ramps(
+            np.ascontiguousarray(resultants[:, a:b]),
+            np.ascontiguousarray(dq[:, a:b]),
+            np.ascontiguousarray(read_noise[a:b]), read_pattern)
+        out['pix'] = out['pix'] + np.int32(a)
+        return out
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=nthreads) as pool:
+        parts = list(pool.map(one, ranges))
+    return {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
+
+
 def fit_ramps_casertano(resultants, dq, read_noise, read_pattern):
     """Fit ramps following Casertano (2022), including averaging partial ramps.
 
@@ -501,7 +539,7 @@ def fit_ramps_casertano(resultants, dq, read_noise, read_pattern):
         dq = dq.reshape(origshape + (1,))
         read_noise = read_noise.reshape(origshape[1:] + (1,))
 
-    rampfitdict = romanisim.ramp_fit_casertano.fit_ramps(
+    rampfitdict = _fit_ramps_threaded(
         resultants.reshape(resultants.shape[0], -1),
         dq.reshape(resultants.shape[0], -1),
         read_noise.reshape(-1),
