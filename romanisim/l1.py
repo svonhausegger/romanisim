@@ -380,7 +380,8 @@ def apportion_counts_to_resultants(
           ``rows_per_block``, never on ``nthreads``.
 
         Cosmic rays, persistence and pedestal noise use the same random
-        streams in every mode.
+        streams in every mode. Counts that are not a 2-D image always use
+        ``'legacy'``.
     nthreads : int or None
         Threads for the blocked engine (default: ``ROMANISIM_NTHREADS``, else
         the CPUs this process may use).
@@ -398,6 +399,11 @@ def apportion_counts_to_resultants(
         dq array marking CR hits in resultants
     """
     mode = mode or os.environ.get('ROMANISIM_APPORTION', 'parallel')
+    if np.ndim(counts) != 2:
+        # the blocked engine works on detector rows; other shapes (e.g. the
+        # 1-D pixel lists of simulate_many_ramps / inject_source_into_image)
+        # are small and keep the legacy loop and its random stream
+        mode = 'legacy'
     if mode == 'legacy':
         return _apportion_legacy(
             counts, tij, pedestal=pedestal,

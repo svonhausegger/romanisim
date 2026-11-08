@@ -126,3 +126,14 @@ def test_threaded_nonlinearity_and_ramp_fit(monkeypatch):
                                     min_pixels=1)
     for k in one:
         assert np.array_equal(one[k], many[k]), k
+
+
+def test_non_image_counts_use_legacy():
+    tij = l1.read_pattern_to_tij(RP)
+    counts = np.random.default_rng(9).poisson(500, 1000)
+    a, _ = l1.apportion_counts_to_resultants(
+        counts, tij, rng=galsim.UniformDeviate(3), mode='parallel')
+    b, _ = l1.apportion_counts_to_resultants(
+        counts, tij, rng=galsim.UniformDeviate(3), mode='legacy')
+    assert a.shape == (len(RP), 1000)
+    assert np.array_equal(a, b)
