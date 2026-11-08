@@ -102,6 +102,9 @@ probabilities were always 1/N, this looks vaguely like it could have a nice anal
 solution.  We don't pursue this avenue further here.
 """
 
+import copy
+import os
+
 import numpy as np
 import asdf
 import galsim
@@ -262,17 +265,47 @@ def apply_dark_decay(resultants, darkdecaysignal, read_pattern, sign=1,
         (t = 0) rather than a resultant, and is corrected at that time.
     """
     tij = read_pattern_to_tij(read_pattern, reference_read=reference_read)
-    for i in range(resultants.shape[0]):
-        correction = np.mean(
-            [dark_decay_for_read(darkdecaysignal, tij[i][j])
-             for j in range(len(tij[i]))], axis=0)
-        resultants[i] += sign * correction
+    ny, nx = resultants.shape[-2:]
+    # Per-pixel read times are a fixed pattern plus the read's start time;
+    # build the pattern once instead of once per read. Same values as
+    # frame_read_times(..., t0=t0) (elementwise base + t0, then trimmed).
+    base = frame_read_times(parameters.read_time, darkdecaysignal['sca'],
+                            t0=0, nborder=parameters.nborder)
+    base = np.ascontiguousarray(base)
+    amp = darkdecaysignal['amplitude']
+    tau = darkdecaysignal['time_constant']
+    frame_offset = 1.5  # as in dark_decay_for_read
+
+    def one_block(rows):
+        r0, r1 = rows
+        b = base[r0:r1]
+        for i in range(resultants.shape[0]):
+            # np.mean over the reads, as before: sequential sum over the
+            # stacked reads, then divide by their number
+            acc = None
+            for t in tij[i]:
+                t0 = t - frame_offset * parameters.read_time
+                sig = amp * np.exp(-(b + t0) / tau)
+                if acc is None:
+                    acc = sig
+                else:
+                    acc += sig
+            np.true_divide(acc, len(tij[i]), out=acc, casting='unsafe')
+            resultants[i, r0:r1] += sign * acc
+
+    nthreads = _default_nthreads()
+    step = max(1, -(-ny // (4 * nthreads)))
+    blocks = [(r0, min(r0 + step, ny)) for r0 in range(0, ny, step)]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=nthreads) as pool:
+        list(pool.map(one_block, blocks))
 
 
 def apportion_counts_to_resultants(
         counts, tij, pedestal=None, pedestal_extra_noise=None,
         inv_linearity=None, crparam=None, persistence=None,
-        tstart=None, rng=None, seed=None, reference_read=False):
+        tstart=None, rng=None, seed=None, reference_read=False,
+        mode=None, nthreads=None, rows_per_block=None):
     """Apportion counts to resultants given read times.
 
     This finds a statistically appropriate assignment of electrons to each
@@ -329,6 +362,31 @@ def apportion_counts_to_resultants(
         If True, prepend a reference read to the resultants, corresponding to a
         zero time read.  `dq` retains its original shape and will not match
         resultants in shape.
+    mode : str or None
+        How the reads are drawn (default: ``ROMANISIM_APPORTION`` or
+        ``'parallel'``):
+
+        * ``'legacy'``: the original full-frame loop, one read at a time.
+        * ``'exact'``: the blocked engine with the legacy random stream.
+          Bit-identical to ``'legacy'`` for the same seed; the cosmic-ray /
+          persistence bookkeeping and the non-linearity run per row block on
+          ``nthreads`` threads, but the binomial draws stay one sequential
+          full-frame stream, so it scales less.
+        * ``'parallel'``: the blocked engine with one independent random
+          stream per row block (``np.random.SeedSequence(seed).spawn``), run
+          on ``nthreads`` threads. Statistically identical to ``'legacy'``
+          (same multinomial split of each pixel's counts over the reads), but
+          a different realization. For a given seed the result depends on
+          ``rows_per_block``, never on ``nthreads``.
+
+        Cosmic rays, persistence and pedestal noise use the same random
+        streams in every mode.
+    nthreads : int or None
+        Threads for the blocked engine (default: ``ROMANISIM_NTHREADS``, else
+        the CPUs this process may use).
+    rows_per_block : int or None
+        Detector rows per block (default 64). Part of the seed semantics of
+        ``'parallel'``.
 
     Returns
     -------
@@ -339,6 +397,31 @@ def apportion_counts_to_resultants(
     dq : np.ndarray[n_resultant, nx, ny]
         dq array marking CR hits in resultants
     """
+    mode = mode or os.environ.get('ROMANISIM_APPORTION', 'parallel')
+    if mode == 'legacy':
+        return _apportion_legacy(
+            counts, tij, pedestal=pedestal,
+            pedestal_extra_noise=pedestal_extra_noise,
+            inv_linearity=inv_linearity, crparam=crparam,
+            persistence=persistence, tstart=tstart, rng=rng, seed=seed,
+            reference_read=reference_read)
+    if mode not in ('exact', 'parallel'):
+        raise ValueError(f'unknown apportion mode {mode!r}')
+    return _apportion_blocked(
+        counts, tij, pedestal=pedestal,
+        pedestal_extra_noise=pedestal_extra_noise,
+        inv_linearity=inv_linearity, crparam=crparam,
+        persistence=persistence, tstart=tstart, rng=rng, seed=seed,
+        reference_read=reference_read, mode=mode, nthreads=nthreads,
+        rows_per_block=rows_per_block)
+
+
+def _apportion_legacy(
+        counts, tij, pedestal=None, pedestal_extra_noise=None,
+        inv_linearity=None, crparam=None, persistence=None,
+        tstart=None, rng=None, seed=None, reference_read=False):
+    """The original read-by-read implementation of
+    `apportion_counts_to_resultants` (``mode='legacy'``)."""
     if not np.all(counts == np.round(counts)):
         raise ValueError('apportion_counts_to_resultants expects the counts '
                          'to be integers!')
@@ -450,6 +533,240 @@ def apportion_counts_to_resultants(
         # order enough that either decision would be fine.
         # the pedestal should _not_ contribute to persistence
         persistence.update(counts_so_far + instrumental_so_far - pedestal, tnow)
+
+    return resultants, dq
+
+
+
+def _default_nthreads():
+    env = os.environ.get('ROMANISIM_NTHREADS')
+    if env:
+        return max(1, int(env))
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # pragma: no cover - non-Linux
+        return max(1, os.cpu_count() or 1)
+
+
+def _rows(a, r0, r1, shape):
+    """Rows r0:r1 of a per-pixel array; scalars and non-image arrays as is."""
+    if np.ndim(a) >= 2 and tuple(np.shape(a)[-2:]) == tuple(shape):
+        return a[..., r0:r1, :]
+    return a
+
+
+def _apportion_blocked(
+        counts, tij, pedestal=None, pedestal_extra_noise=None,
+        inv_linearity=None, crparam=None, persistence=None,
+        tstart=None, rng=None, seed=None, reference_read=False,
+        mode='parallel', nthreads=None, rows_per_block=None):
+    """Blocked implementation of `apportion_counts_to_resultants`.
+
+    Two passes:
+
+    1. Sequentially, the instrumental image (pedestal, pedestal noise, cosmic
+       rays, persistence) is stepped through all reads exactly as in the
+       legacy loop, with the same random streams. Neither cosmic rays nor
+       persistence depend on the accumulated counts, so this needs no
+       counts; it records, per read, the pixels whose instrumental value
+       changed and their new values (sparse), and the cosmic-ray DQ flags.
+    2. Per block of detector rows (in parallel threads), each block runs the
+       whole read sequence on its own rows: binomial draw, counts so far,
+       replay of the sparse instrumental updates, non-linearity, resultant
+       sums. All array work is block-sized (cache-resident), and numpy
+       releases the GIL in the binomial draws and the ufuncs.
+
+    With ``mode='exact'`` the binomial draws come from the legacy stream in
+    the legacy order (full frame, read by read), so the output is
+    bit-identical to ``_apportion_legacy``; only the rest runs per block.
+    """
+    if not np.all(counts == np.round(counts)):
+        raise ValueError('apportion_counts_to_resultants expects the counts '
+                         'to be integers!')
+    counts = np.clip(counts, 0, 2 * 10**9).astype('i4')
+
+    if rng is None and seed is None:
+        seed = 46
+        log.warning(
+            'No RNG set, constructing a new default RNG from default seed.')
+    if rng is None:
+        rng = galsim.GaussianDeviate(seed)
+
+    rng_numpy_seed = rng.raw()
+    rng_numpy = np.random.default_rng(rng_numpy_seed)
+    rng_numpy_cr = np.random.default_rng(rng_numpy_seed + 1)
+    rng_numpy_ps = np.random.default_rng(rng_numpy_seed + 2)
+    rng_numpy_pedestal = np.random.default_rng(rng_numpy_seed + 3)
+
+    pij = tij_to_pij(tij, remaining=True)
+    nread = sum(len(pi) for pi in pij)
+    shape = counts.shape
+    ny, nx = shape
+    nref = 1 if reference_read else 0
+    resultants = np.zeros((len(tij) + nref,) + shape, dtype='f4')
+    dq = np.zeros((len(tij),) + shape, dtype=np.uint32)
+
+    instrumental = np.zeros(shape, dtype='f4')
+    if pedestal is None:
+        pedestal = 0
+    instrumental += pedestal
+    if pedestal_extra_noise is not None:
+        pedestal_noise = rng_numpy_pedestal.normal(0, pedestal_extra_noise, shape)
+        instrumental += pedestal_noise
+
+    if reference_read:
+        if inv_linearity is not None:
+            resultants[0, ...] = inv_linearity.apply(
+                instrumental, electrons=True)
+        else:
+            resultants[0, ...] = instrumental
+
+    if persistence is not None and tstart is None:
+        raise ValueError('tstart must be set if persistence is set!')
+    if persistence is not None:
+        tstart = tstart.mjd
+
+    # --- pass 1: instrumental timeline, sparse per read -------------------
+    instrumental0 = instrumental.copy()
+    flat = instrumental.reshape(-1)
+    upd_idx, upd_val = [], []
+    tnow = None
+    for i, pi in enumerate(pij):
+        for j, p in enumerate(pi):
+            touched = []
+            if crparam is not None:
+                hits = []
+                cr.simulate_crs(instrumental, parameters.read_time,
+                                **crparam, rng=rng_numpy_cr, hits=hits)
+                if hits:
+                    fi = np.concatenate([np.ravel_multi_index(
+                        (np.asarray(ii), np.asarray(jj)), shape)
+                        for ii, jj, _ in hits])
+                    old = np.concatenate([o for _, _, o in hits])
+                    # the value before this read is the one recorded at the
+                    # first deposit into each pixel
+                    ufi, first = np.unique(fi, return_index=True)
+                    changed = ufi[flat[ufi] != old[first]]
+                    if changed.size:
+                        dq[i].reshape(-1)[changed] |= parameters.dqbits[
+                            'jump_det']
+                    touched.append(ufi)
+            if persistence is not None:
+                tnow = tstart + tij[i][j] / (24 * 60 * 60)
+                persistence.add_to_read(
+                    instrumental, tnow, rng=rng_numpy_ps)
+                if np.size(persistence.index):
+                    touched.append(np.asarray(persistence.index, np.int64))
+            if touched:
+                idx = np.unique(np.concatenate(touched))
+                upd_idx.append(idx)
+                upd_val.append(flat[idx].copy())
+            else:
+                upd_idx.append(np.zeros(0, np.int64))
+                upd_val.append(np.zeros(0, 'f4'))
+
+    # --- pass 2: reads per row block ---------------------------------------
+    nthreads = nthreads or _default_nthreads()
+    rows_per_block = rows_per_block or int(
+        os.environ.get('ROMANISIM_ROWS_PER_BLOCK', 64))
+    if mode == 'exact':
+        # one block per read step would break the legacy draw order; draw
+        # full-frame reads from the legacy stream and hand each block its
+        # rows (see below)
+        blocks = [(r0, min(r0 + rows_per_block, ny))
+                  for r0 in range(0, ny, rows_per_block)]
+    else:
+        blocks = [(r0, min(r0 + rows_per_block, ny))
+                  for r0 in range(0, ny, rows_per_block)]
+        streams = [np.random.default_rng(s) for s in
+                   np.random.SeedSequence(rng_numpy_seed).spawn(len(blocks))]
+
+    counts_so_far = np.zeros(shape, dtype='i4')
+    nl_blocks = []
+    for r0, r1 in blocks:
+        if inv_linearity is None:
+            nl_blocks.append(None)
+            continue
+        b = copy.copy(inv_linearity)
+        b.gain = _rows(inv_linearity.gain, r0, r1, shape)
+        b.saturation = _rows(inv_linearity.saturation, r0, r1, shape)
+        b.coeffs = _rows(inv_linearity.coeffs, r0, r1, shape)
+        nl_blocks.append(b)
+
+    def block_slices(r0, r1):
+        lo, hi = r0 * nx, r1 * nx
+        out = []
+        for idx in upd_idx:
+            a = np.searchsorted(idx, lo)
+            b = np.searchsorted(idx, hi)
+            out.append((a, b))
+        return out
+
+    class _Block:
+        """State of one row block between read steps."""
+        def __init__(self, bi, r0, r1):
+            self.bi, self.r0, self.r1 = bi, r0, r1
+            self.counts = counts[r0:r1]
+            self.cs = counts_so_far[r0:r1]          # view: written in place
+            self.inst = instrumental0[r0:r1].copy()
+            self.iflat = self.inst.reshape(-1)
+            self.rc = np.zeros((r1 - r0, nx), dtype='f4')
+            self.sl = block_slices(r0, r1)
+            self.nl = nl_blocks[bi]
+
+        def step(self, k, read):
+            # read: this block's draws for read k (or None to draw here)
+            if read is None:
+                read = streams[self.bi].binomial(
+                    self.counts - self.cs, self._p[k])
+            self.cs += read
+            a, b = self.sl[k]
+            if b > a:
+                self.iflat[upd_idx[k][a:b] - self.r0 * nx] = upd_val[k][a:b]
+            if self.nl is not None:
+                self.rc += self.nl.apply(self.cs + self.inst, electrons=True)
+            else:
+                self.rc += self.cs + self.inst
+
+        def close_resultant(self, i, nreads):
+            resultants[i + nref, self.r0:self.r1] = self.rc / nreads
+            self.rc[...] = 0
+
+    flatp = [p for pi in pij for p in pi]
+    state = [_Block(bi, r0, r1) for bi, (r0, r1) in enumerate(blocks)]
+    for st in state:
+        st._p = flatp
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=nthreads) as pool:
+        if mode == 'parallel':
+            def run_block(st):
+                k = 0
+                for i, pi in enumerate(pij):
+                    for _ in pi:
+                        st.step(k, None)
+                        k += 1
+                    st.close_resultant(i, len(pi))
+            list(pool.map(run_block, state))
+        else:
+            # exact: legacy draw order -- one full-frame binomial per read
+            # from the legacy stream, then the blocks finish that read in
+            # parallel.
+            k = 0
+            for i, pi in enumerate(pij):
+                for p in pi:
+                    read = rng_numpy.binomial(counts - counts_so_far, p)
+                    list(pool.map(
+                        lambda st: st.step(k, read[st.r0:st.r1]), state))
+                    k += 1
+                list(pool.map(
+                    lambda st: st.close_resultant(i, len(pi)), state))
+
+    if inv_linearity is not None:
+        dq |= inv_linearity.dq
+
+    if persistence is not None:
+        persistence.update(counts_so_far + instrumental - pedestal, tnow)
 
     return resultants, dq
 

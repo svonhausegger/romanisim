@@ -283,6 +283,7 @@ def simulate_crs(
     pixel_depth=None,
     rng=None,
     seed=47,
+    hits=None,
 ):
     """Adds CRs to an existing image.
 
@@ -308,6 +309,11 @@ def simulate_crs(
         Random number generator to use
     seed : int
         seed to use for random number generator
+    hits : list or None
+        If a list, append ``(ii, jj, old)`` for every track: the pixel
+        indices it deposits into and their values just before the deposit.
+        Lets callers find the pixels a call changed without comparing whole
+        frames. Does not change the random sequence or the result.
 
     Returns
     -------
@@ -345,6 +351,8 @@ def simulate_crs(
     for i0, j0, i1, j1, counts_per_pix in zip(cr_i0, cr_j0, cr_i1, cr_j1, cr_counts_per_pix):
         ii, jj, length_2d = traverse([i0, j0], [i1, j1], N_i=N_i, N_j=N_j)
         length_3d = ((pixel_depth / pixel_size) ** 2 + length_2d ** 2) ** 0.5
+        if hits is not None:
+            hits.append((ii, jj, image[ii, jj].copy()))
         image[ii, jj] += rng.poisson(counts_per_pix * length_3d)
 
     return image
